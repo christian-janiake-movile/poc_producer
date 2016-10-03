@@ -1,0 +1,19 @@
+group 'com.movile'
+version '1.0-SNAPSHOT'
+
+apply plugin: 'java'
+
+sourceCompatibility = 1.5
+
+repositories {
+    mavenLocal()
+    mavenCentral()
+    maven {
+        url "http://nexus.it.movile.com:8081/nexus/content/repositories/releases/"
+    }
+}
+
+dependencies {
+    testCompile group: 'junit', name: 'junit', version: '4.11'
+    compile group: 'com.movile', name: 'pgle', version: '1.0-SNAPSHOT'
+}
