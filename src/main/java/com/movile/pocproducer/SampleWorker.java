@@ -25,23 +25,40 @@ public class SampleWorker implements Worker, Runnable {
     }
 
     public void work() throws InterruptedException {
-        onDuty = true;
+        System.out.println("WORK WORK WORK WORK WORK WORK WORK WORK WORK WORK WORK WORK WORK WORK WORK WORK WORK WORK WORK WORK");
+        this.onDuty = true;
+        synchronized(this) {
+            this.notify();
+        }
     }
 
     public void stop() {
-        onDuty = false;
+        System.out.println("STOP STOP STOP STOP STOP STOP STOP STOP STOP STOP STOP STOP STOP STOP STOP STOP STOP STOP STOP STOP");
+        this.onDuty = false;
     }
 
     public void run() {
+
         while(true) {
-            if(onDuty) {
-                System.out.println(peerGroup.getName() + " is working");
+
+            synchronized(this) {
+                try {
+                    this.wait();
+                } catch (InterruptedException e) {
+                    e.printStackTrace();
+                }
             }
-            try {
-                Thread.sleep(TimeUnit.SECONDS.toMillis(2));
-            } catch (InterruptedException e) {
-                e.printStackTrace();
+
+            while(onDuty) {
+
+                System.out.println(peerGroup.getName() + " is working. ON DUTY: " + onDuty);
+                try {
+                    Thread.sleep(500l);
+                } catch (InterruptedException e) {
+                    e.printStackTrace();
+                }
             }
+
         }
     }
 }
