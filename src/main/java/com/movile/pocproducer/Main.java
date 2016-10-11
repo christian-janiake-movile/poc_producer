@@ -27,9 +27,10 @@ public class Main {
         properties.setProperty("group.leadershipInterval", "60000");
         properties.setProperty("group.workerClass", "sampleWorker"); //"com.movile.pocproducer.SampleWorker");
         properties.setProperty("engine.carrierId", "1");
-        properties.setProperty("engine.paginationTable", "hybrid.1");
+        properties.setProperty("engine.paginationTable", "temporary.hybrid_engine_1");
         properties.setProperty("engine.refreshIntervalMinutes", "15");
-        properties.setProperty("engine.usersPerMinute", "1000");
+        properties.setProperty("engine.usersPerCycle", "100");
+        properties.setProperty("engine.usersBatchSize", "10");
 
         PeerGroup peerGroup = (PeerGroup) ctx.getBean("peerGroup", 1, properties);
     }

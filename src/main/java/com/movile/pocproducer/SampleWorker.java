@@ -15,15 +15,22 @@ import org.springframework.context.ApplicationContext;
 import org.springframework.context.annotation.Scope;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
+import org.springframework.jms.core.JmsTemplate;
+import org.springframework.jms.core.MessageCreator;
 import org.springframework.stereotype.Component;
 
 import javax.annotation.PostConstruct;
+import javax.jms.Destination;
+import javax.jms.JMSException;
+import javax.jms.Message;
+import javax.jms.Session;
 import java.nio.charset.Charset;
 import java.sql.ResultSet;
 import java.sql.SQLException;
-import java.util.Date;
-import java.util.List;
-import java.util.Map;
+import java.time.Duration;
+import java.time.Instant;
+import java.time.temporal.ChronoUnit;
+import java.util.*;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -33,7 +40,7 @@ public class SampleWorker implements Worker, Runnable {
 
     private PeerGroup peerGroup;
     private boolean onDuty = false;
-    private long executionStart;
+    private Instant executionStart;
 
     private Date lastDatabaseQuery;
     private AtomicInteger lastRowRead = new AtomicInteger(0);
@@ -41,8 +48,9 @@ public class SampleWorker implements Worker, Runnable {
     private Integer carrierId;
     private String paginationTable;
     private Integer refreshIntervalMinutes;
-    private Integer usersPerMinute;
+    private Integer usersPerCycle;
     private Long forceRefreshIdleTime;
+    private Integer usersBatchSize;
 
     @Autowired
     RedisConnectionManager redis;
@@ -55,6 +63,11 @@ public class SampleWorker implements Worker, Runnable {
 
     @Autowired
     private ApplicationContext ctx;
+
+    @Autowired
+    private Destination destination;
+
+    private JmsTemplate jmsTemplate;
 
     SecurityCache securityCache;
 
@@ -71,12 +84,13 @@ public class SampleWorker implements Worker, Runnable {
         Validate.isTrue(peerGroup.getProperties().containsKey("engine.carrierId"), "Invalid value for engine.carrierId on peerGroup " + peerGroup.getName());
         Validate.isTrue(peerGroup.getProperties().containsKey("engine.paginationTable"), "Invalid value for engine.paginationTable on peerGroup " + peerGroup.getName());
         Validate.isTrue(peerGroup.getProperties().containsKey("engine.refreshIntervalMinutes"), "Invalid value for engine.refreshIntervalMinutes on peerGroup " + peerGroup.getName());
-        Validate.isTrue(peerGroup.getProperties().containsKey("engine.usersPerMinute"), "Invalid value for engine.usersPerMinute on peerGroup " + peerGroup.getName());
+        Validate.isTrue(peerGroup.getProperties().containsKey("engine.usersPerCycle"), "Invalid value for engine.usersPerCycle on peerGroup " + peerGroup.getName());
 
         this.carrierId = Integer.parseInt(peerGroup.getProperties().getProperty("engine.carrierId"));
         this.paginationTable = peerGroup.getProperties().getProperty("engine.paginationTable");
         this.refreshIntervalMinutes = Integer.parseInt(peerGroup.getProperties().getProperty("engine.refreshIntervalMinutes"));
-        this.usersPerMinute = Integer.parseInt(peerGroup.getProperties().getProperty("engine.usersPerMinute"));
+        this.usersPerCycle = Integer.parseInt(peerGroup.getProperties().getProperty("engine.usersPerCycle"));
+        this.usersBatchSize = Integer.parseInt(peerGroup.getProperties().getProperty("engine.usersBatchSize", "100"));
     }
 
     public void work() throws InterruptedException {
@@ -89,6 +103,7 @@ public class SampleWorker implements Worker, Runnable {
     @PostConstruct
     public void init() {
         securityCache = (SecurityCache) ctx.getBean("securityCache", carrierId);
+        jmsTemplate = (JmsTemplate) ctx.getBean("jmsTemplate", "hybridChargeQueue_I1");
         loadJdbcStatements();
     }
 
@@ -111,74 +126,139 @@ public class SampleWorker implements Worker, Runnable {
             }
 
             while(onDuty) {
-                executionStart = System.currentTimeMillis();
+                executionStart = Instant.now();
+                try {
 
-                // read & update pagination status on redis
-                String redisKey = paginationInfoKey();
-                Map<String, String> currentStatus = redis.hgetall(redisKey);
+                    // read & update pagination status on redis
+                    String redisKey = paginationInfoKey();
+                    Map<String, String> currentStatus = redis.hgetall(redisKey);
 
-                boolean refreshTable = false;
+                    boolean refreshTable = false;
 
-                Long lastRefresh = null;
-                Integer currentOffset = null;
-                Integer totalRecords = null;
+                    Long lastRefresh = null;
+                    Integer totalRecords = null;
 
-                if(currentStatus != null && currentStatus.containsKey("lastRefresh")) {
-                    lastRefresh = Long.parseLong(currentStatus.get("lastRefresh"));
-                    currentOffset = new Integer(currentStatus.getOrDefault("offset", "0"));
-                    totalRecords = new Integer(currentStatus.getOrDefault("totalRecords", "0"));
+                    if (currentStatus != null && currentStatus.containsKey("lastRefresh")) {
+                        log.info("Pagination info data: {}", currentStatus.toString());
 
-                    if(lastRefresh + TimeUnit.MINUTES.toMillis(refreshIntervalMinutes) < System.currentTimeMillis()) {
-                        log.info("Interval exceeded. Generate pagination table {}", paginationTable);
-                        refreshTable = true;
-                    } else if(!DateUtils.isSameDay(new Date(), new Date(lastRefresh))) {
-                        log.info("Turn of the day. Generate pagination table {}", paginationTable);
-                        refreshTable = true;
-                    } else if(forceRefreshIdleTime != null && forceRefreshIdleTime.longValue() <= System.currentTimeMillis()) {
-                        log.info("Producer is idle. Generate pagination table {}", paginationTable);
+                        lastRefresh = Long.parseLong(currentStatus.get("lastRefresh"));
+                        totalRecords = new Integer(currentStatus.getOrDefault("totalRecords", "0"));
+                        this.offset = new Integer(currentStatus.getOrDefault("offset", "0"));
+
+                        if (lastRefresh + TimeUnit.MINUTES.toMillis(refreshIntervalMinutes) < System.currentTimeMillis()) {
+                            log.info("Interval exceeded. Generate pagination table {}", paginationTable);
+                            refreshTable = true;
+                        } else if (!DateUtils.isSameDay(new Date(), new Date(lastRefresh))) {
+                            log.info("Turn of the day. Generate pagination table {}", paginationTable);
+                            refreshTable = true;
+                        } else if (forceRefreshIdleTime != null && forceRefreshIdleTime.longValue() <= System.currentTimeMillis()) {
+                            log.info("Producer is idle. Generate pagination table {}", paginationTable);
+                            refreshTable = true;
+                        }
+
+                    } else {
+                        log.info("First execution. Generate pagination table {}", paginationTable);
                         refreshTable = true;
                     }
 
-                } else {
-                    log.info("First execution. Generate pagination table {}", paginationTable);
-                    refreshTable = true;
-                }
+                    if (refreshTable) {
+                        lastRefresh = System.currentTimeMillis();
+                        totalRecords = generatePaginationTable();
+                        this.offset = 0;
+                    }
 
-                if(refreshTable) {
-                    lastRefresh = System.currentTimeMillis();
-                    currentOffset = 0;
-                    totalRecords = generatePaginationTable();
-                }
+                    int usersSubmitted = 0;
+                    List<String> usersBatch = new LinkedList<String>();
+                    BloomFilter<CharSequence> newBloomFilter = BloomFilter.create(Funnels.stringFunnel(Charset.forName("UTF-8")), usersPerCycle);
 
-                if(currentOffset < totalRecords) {
+                    Map<String, BloomFilter<CharSequence>> bloomFilters = securityCache.loadBloomFilters();
 
-                    List<String> users = fetchUsers();
+                    // submit users while records available and target number of users not reached
+                    while (offset < totalRecords && usersSubmitted < usersPerCycle) {
 
-                    currentOffset += Math.min(totalRecords, currentOffset + usersPerMinute);
+                        // fetch records enough to reach target number of users
+                        List<String> users = fetchUsers(usersPerCycle - usersSubmitted);
+                        log.debug("{} users fetched", users.size());
+
+                        for (String msisdn : users) {
+
+                            // filter users that have been processed recently
+                            if (!securityCache.isOnCache(msisdn, bloomFilters)) {
+                                log.debug("User {} submitted", msisdn);
+                                newBloomFilter.put(msisdn);
+                                securityCache.putOnSecurityCache(msisdn, executionStart.toEpochMilli());
+                                usersBatch.add(msisdn);
+                                usersSubmitted++;
+
+                                // batch is complete: pack and ship
+                                if (usersBatch.size() == usersBatchSize) {
+                                    putOnProcessingQueue(usersBatch);
+                                    usersBatch = new LinkedList<String>();
+                                }
+                            } else {
+                                log.debug("User {} BLOCKED", msisdn);
+                            }
+                        }
+                    }
+
+                    log.info("User submission finished");
+
+                    // update pagination status on redis
                     currentStatus.put("lastRefresh", Long.toString(lastRefresh));
-                    currentStatus.put("offset", Integer.toString(currentOffset));
+                    currentStatus.put("offset", Integer.toString(offset));
                     currentStatus.put("totalRecords", Integer.toString(totalRecords));
                     redis.hmset(redisKey, currentStatus);
 
-                    Map<String, BloomFilter<CharSequence>> bloomFilters = securityCache.loadBloomFilters();
-                    BloomFilter<CharSequence> newBloomFilter = BloomFilter.create(Funnels.stringFunnel(Charset.forName("UTF-8")), usersPerMinute);
+                    log.info("Updated pagination info with data: {}", currentStatus.toString());
 
-                    // check & update cache & send to queue
-                    for(String msisdn:users) {
-
-                        if(!securityCache.isOnCache(msisdn, bloomFilters)) {
-                            newBloomFilter.put(msisdn);
-                            securityCache.putOnSecurityCache(msisdn, executionStart);
-                        }
-
+                    // pack and ship last batch
+                    if (usersBatch.size() > 0) {
+                        putOnProcessingQueue(usersBatch);
                     }
-                    securityCache.writeBloomFilter(newBloomFilter, executionStart);
 
-                } else if(forceRefreshIdleTime == null) {
-                    forceRefreshIdleTime = System.currentTimeMillis() + TimeUnit.MINUTES.toMillis(10);
+                    // store submitted users bloomfilter into sorted set
+                    if (usersSubmitted > 0) {
+                        log.info("Store new created bloomfilter under key {}", executionStart.toEpochMilli());
+                        securityCache.writeBloomFilter(newBloomFilter, executionStart.toEpochMilli());
+                    }
+
+                    // if query results are exhausted, schedule a forced refresh
+                    if (offset >= totalRecords && forceRefreshIdleTime == null) {
+                        log.info("Engine is going to be idle for now on, force refresh in 10 minutes");
+                        forceRefreshIdleTime = System.currentTimeMillis() + TimeUnit.MINUTES.toMillis(10);
+                    }
+
+                } catch(Exception e) {
+                    log.error("Error processing user selection", e);
+                }
+
+                Instant wakeUp = executionStart.plus(1, ChronoUnit.MINUTES);
+                Duration sleepDuration = Duration.between(Instant.now(), wakeUp);
+                if (!sleepDuration.isNegative()) {
+                    try {
+                        log.info("Sleep {} seconds", sleepDuration.getSeconds());
+                        Thread.sleep(sleepDuration.toMillis());
+                    } catch (InterruptedException e) {
+                        e.printStackTrace();
+                    }
+                } else {
+                    log.info("Execution took {}s more than supposed", sleepDuration.getSeconds());
                 }
             }
         }
+    }
+
+    private void putOnProcessingQueue(List<String> usersList) {
+        log.info("Put batch on queue with {} elements", usersList.size());
+
+        jmsTemplate.send(new MessageCreator() {
+            public Message createMessage(Session session) throws JMSException {
+                return session.createTextMessage(formatMessage(usersList));
+            }});
+    }
+
+    private String formatMessage(List<String> usersList) {
+        return "";
     }
 
     private Integer generatePaginationTable() {
@@ -186,8 +266,8 @@ public class SampleWorker implements Worker, Runnable {
         return jdbcTemplate.update(masterQueryCommand);
     }
 
-    private List<String> fetchUsers() {
-        List<String> result = jdbcTemplate.query(loadBatchQuery, new Object[] {offset, (offset + usersPerMinute)}, new RowMapper() {
+    private List<String> fetchUsers(int numRecords) {
+        List<String> result = jdbcTemplate.query(loadBatchQuery, new Object[] {offset, (offset + numRecords)}, new RowMapper() {
 
             @Override
             public Object mapRow(ResultSet rs, int rowNum) throws SQLException {

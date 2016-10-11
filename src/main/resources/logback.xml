@@ -1,0 +1,62 @@
+<configuration debug="true" scan="true">
+    <jmxConfigurator/>
+
+    <property name="LOG_PATH" value="${ENV_ENGINE_LOG_PATH}"/>
+    <property name="DEFAULT_PATTERN"
+              value="[%-5level] [%date{ISO8601}] [%class{50}->%method:%line]| %msg%n"/>
+    <property name="EXCEPTION_PATTERN"
+              value="%highlight([%-5level]) %magenta([%date{ISO8601}]) %yellow([%X{stamp}]) %magenta([%class->%method:%line]) [Exception %msg - Thread Id %thread - Start]%n%xException{8}%n[Exception %msg - End]%n"/>
+    <property name="DEFAULT_MAX_FILE_SIZE" value="512MB"/>
+    <property name="DEFAULT_MAX_HISTORY" value="100"/>
+    <property name="DEFAULT_ASYNC_QUEUE_SIZE" value="256"/>
+
+    <appender name="STDOUT" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <pattern>${DEFAULT_PATTERN}</pattern>
+        </encoder>
+    </appender>
+
+    <appender name="ap_system"
+              class="ch.qos.logback.core.rolling.RollingFileAppender">
+        <file>${LOG_PATH}/system.log</file>
+        <rollingPolicy class="ch.qos.logback.core.rolling.TimeBasedRollingPolicy">
+            <!-- rollover daily -->
+            <fileNamePattern>${LOG_PATH}/system.k3m.%d{yyyy-MM-dd}.log.%i.gz
+            </fileNamePattern>
+            <timeBasedFileNamingAndTriggeringPolicy
+                    class="ch.qos.logback.core.rolling.SizeAndTimeBasedFNATP">
+                <maxFileSize>${DEFAULT_MAX_FILE_SIZE}</maxFileSize>
+            </timeBasedFileNamingAndTriggeringPolicy>
+            <maxHistory>${DEFAULT_MAX_HISTORY}</maxHistory>
+        </rollingPolicy>
+        <encoder>
+            <pattern>${DEFAULT_PATTERN}</pattern>
+        </encoder>
+    </appender>
+
+    <appender name="ap_redis"
+              class="ch.qos.logback.core.rolling.RollingFileAppender">
+        <file>${LOG_PATH}/redis.log</file>
+        <rollingPolicy class="ch.qos.logback.core.rolling.TimeBasedRollingPolicy">
+            <!-- rollover daily -->
+            <fileNamePattern>${LOG_PATH}/redis.k3m.%d{yyyy-MM-dd}.log.%i.gz
+            </fileNamePattern>
+            <timeBasedFileNamingAndTriggeringPolicy
+                    class="ch.qos.logback.core.rolling.SizeAndTimeBasedFNATP">
+                <maxFileSize>${DEFAULT_MAX_FILE_SIZE}</maxFileSize>
+            </timeBasedFileNamingAndTriggeringPolicy>
+            <maxHistory>${DEFAULT_MAX_HISTORY}</maxHistory>
+        </rollingPolicy>
+        <encoder>
+            <pattern>${DEFAULT_PATTERN}</pattern>
+        </encoder>
+    </appender>
+
+    <logger name="com.lambdaworks.redis" level="${ENV_ENGINE_DEFAULT_LOG_LEVEL}" additivity="false">
+        <appender-ref ref="ap_redis"/>
+    </logger>
+
+    <logger name="com.movile" level="TRACE" additivity="false">
+        <appender-ref ref="ap_system"/>
+    </logger>
+</configuration>
