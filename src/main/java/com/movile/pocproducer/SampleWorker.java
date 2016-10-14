@@ -39,18 +39,21 @@ import java.util.concurrent.atomic.AtomicInteger;
 public class SampleWorker implements Worker, Runnable {
 
     private PeerGroup peerGroup;
-    private boolean onDuty = false;
     private Instant executionStart;
 
     private Date lastDatabaseQuery;
     private AtomicInteger lastRowRead = new AtomicInteger(0);
 
-    private Integer carrierId;
-    private String paginationTable;
-    private Integer refreshIntervalMinutes;
-    private Integer usersPerCycle;
+    private Integer carrierId;              // carrier id used on query to fetch users
+    private String paginationTable;         // name of table used to paginate the results
+    private Integer refreshIntervalMinutes; // interval pagination table is generated
+    private Integer forceRefresIdleMinutes; // force refresh if idle for some minutes; default is 15 minutes
+    private Integer usersPerCycle;          // users selected on each cycle
+    private Integer cycleDurationInSeconds; // if positive value, each cycle should take at least this duration;
+                                            // if zero or negative, code runs only once each time a leader is selected
+                                            // default is 60 seconds
+    private Integer usersBatchSize;         // size of each batch to be submmited to queue; default is 100 users
     private Long forceRefreshIdleTime;
-    private Integer usersBatchSize;
 
     @Autowired
     RedisConnectionManager redis;
@@ -89,12 +92,13 @@ public class SampleWorker implements Worker, Runnable {
         this.carrierId = Integer.parseInt(peerGroup.getProperties().getProperty("engine.carrierId"));
         this.paginationTable = peerGroup.getProperties().getProperty("engine.paginationTable");
         this.refreshIntervalMinutes = Integer.parseInt(peerGroup.getProperties().getProperty("engine.refreshIntervalMinutes"));
+        this.forceRefresIdleMinutes = Integer.parseInt(peerGroup.getProperties().getProperty("engine.forceRefresIdleMinutes", "15"));
         this.usersPerCycle = Integer.parseInt(peerGroup.getProperties().getProperty("engine.usersPerCycle"));
+        this.cycleDurationInSeconds = Integer.parseInt(peerGroup.getProperties().getProperty("engine.cycleDurationInSeconds", "60"));
         this.usersBatchSize = Integer.parseInt(peerGroup.getProperties().getProperty("engine.usersBatchSize", "100"));
     }
 
     public void work() throws InterruptedException {
-        this.onDuty = true;
         synchronized(this) {
             this.notify();
         }
@@ -105,10 +109,6 @@ public class SampleWorker implements Worker, Runnable {
         securityCache = (SecurityCache) ctx.getBean("securityCache", carrierId);
         jmsTemplate = (JmsTemplate) ctx.getBean("jmsTemplate", "hybridChargeQueue_I1");
         loadJdbcStatements();
-    }
-
-    public void stop() {
-        this.onDuty = false;
     }
 
     public void run() {
@@ -125,7 +125,7 @@ public class SampleWorker implements Worker, Runnable {
                 }
             }
 
-            while(onDuty) {
+            while(peerGroup.isLeader()) {
                 executionStart = Instant.now();
                 try {
 
@@ -174,11 +174,19 @@ public class SampleWorker implements Worker, Runnable {
                     Map<String, BloomFilter<CharSequence>> bloomFilters = securityCache.loadBloomFilters();
 
                     // submit users while records available and target number of users not reached
-                    while (offset < totalRecords && usersSubmitted < usersPerCycle) {
+                    while (peerGroup.isLeader() && offset < totalRecords && usersSubmitted < usersPerCycle) {
 
                         // fetch records enough to reach target number of users
                         List<String> users = fetchUsers(usersPerCycle - usersSubmitted);
                         log.debug("{} users fetched", users.size());
+
+                        // check if leadership ended during database access
+                        if(!peerGroup.isLeader()) {
+                            continue;
+                        }
+
+                        offset += users.size();
+                        writePaginationStatus(redisKey, lastRefresh, totalRecords);
 
                         for (String msisdn : users) {
 
@@ -203,14 +211,6 @@ public class SampleWorker implements Worker, Runnable {
 
                     log.info("User submission finished");
 
-                    // update pagination status on redis
-                    currentStatus.put("lastRefresh", Long.toString(lastRefresh));
-                    currentStatus.put("offset", Integer.toString(offset));
-                    currentStatus.put("totalRecords", Integer.toString(totalRecords));
-                    redis.hmset(redisKey, currentStatus);
-
-                    log.info("Updated pagination info with data: {}", currentStatus.toString());
-
                     // pack and ship last batch
                     if (usersBatch.size() > 0) {
                         putOnProcessingQueue(usersBatch);
@@ -223,29 +223,44 @@ public class SampleWorker implements Worker, Runnable {
                     }
 
                     // if query results are exhausted, schedule a forced refresh
-                    if (offset >= totalRecords && forceRefreshIdleTime == null) {
+                    if (offset >= totalRecords && forceRefreshIdleTime == null && forceRefresIdleMinutes > 0) {
                         log.info("Engine is going to be idle for now on, force refresh in 10 minutes");
-                        forceRefreshIdleTime = System.currentTimeMillis() + TimeUnit.MINUTES.toMillis(10);
+                        forceRefreshIdleTime = System.currentTimeMillis() + TimeUnit.MINUTES.toMillis(forceRefresIdleMinutes);
                     }
 
                 } catch(Exception e) {
                     log.error("Error processing user selection", e);
                 }
 
-                Instant wakeUp = executionStart.plus(1, ChronoUnit.MINUTES);
-                Duration sleepDuration = Duration.between(Instant.now(), wakeUp);
-                if (!sleepDuration.isNegative()) {
-                    try {
-                        log.info("Sleep {} seconds", sleepDuration.getSeconds());
-                        Thread.sleep(sleepDuration.toMillis());
-                    } catch (InterruptedException e) {
-                        e.printStackTrace();
+                // if duration of cycle is controlled, sleep until expected duration is reached
+                if(cycleDurationInSeconds > 0) {
+                    Instant wakeUp = executionStart.plus(cycleDurationInSeconds, ChronoUnit.SECONDS);
+                    Duration sleepDuration = Duration.between(Instant.now(), wakeUp);
+                    if (!sleepDuration.isNegative()) {
+                        try {
+                            log.info("Sleep {} seconds", sleepDuration.getSeconds());
+                            Thread.sleep(sleepDuration.toMillis());
+                        } catch (InterruptedException e) {
+                            e.printStackTrace();
+                        }
+                    } else {
+                        log.info("Execution took {}s more than supposed", sleepDuration.getSeconds());
                     }
-                } else {
-                    log.info("Execution took {}s more than supposed", sleepDuration.getSeconds());
                 }
             }
         }
+    }
+
+    private void writePaginationStatus(String redisKey, Long lastRefresh, Integer totalRecords) {
+        Map<String, String> currentStatus = new HashMap<String, String>();
+
+        // update pagination status on redis
+        currentStatus.put("lastRefresh", Long.toString(lastRefresh));
+        currentStatus.put("offset", Integer.toString(offset));
+        currentStatus.put("totalRecords", Integer.toString(totalRecords));
+        redis.hmset(redisKey, currentStatus);
+
+        log.info("Updated pagination info with data: {}", currentStatus.toString());
     }
 
     private void putOnProcessingQueue(List<String> usersList) {
@@ -267,13 +282,13 @@ public class SampleWorker implements Worker, Runnable {
     }
 
     private List<String> fetchUsers(int numRecords) {
+        log.info("Fetching {} records starting at #{}", numRecords, offset);
         List<String> result = jdbcTemplate.query(loadBatchQuery, new Object[] {offset, (offset + numRecords)}, new RowMapper() {
 
             @Override
             public Object mapRow(ResultSet rs, int rowNum) throws SQLException {
-                offset = rs.getInt("id");
                 String phone = rs.getString("phone");
-                log.info("User {} loaded, offset={}", phone, offset);
+                log.info("User {} loaded", phone);
                 return phone;
             }
         });
