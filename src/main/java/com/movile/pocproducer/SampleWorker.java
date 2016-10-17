@@ -246,6 +246,9 @@ public class SampleWorker implements Worker, Runnable {
                     } else {
                         log.info("Execution took {}s more than supposed", sleepDuration.getSeconds());
                     }
+                } else {
+                    // if duration of cycle is zero or negative, code runs only once each election
+                    break;
                 }
             }
         }
